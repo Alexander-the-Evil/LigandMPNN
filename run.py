@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from data_utils import (
     alphabet,
+    atom_order,
     element_dict_rev,
     featurize,
     get_score,
@@ -22,6 +23,13 @@ from data_utils import (
 from model_utils import ProteinMPNN
 from prody import writePDB
 from sc_utils import Packer, pack_side_chains
+
+
+def _load_str_or_file(arg):
+    if os.path.isfile(arg):
+        with open(arg) as f:
+            return f.read().strip()
+    return arg.strip()
 
 
 def main(args) -> None:
@@ -197,6 +205,16 @@ def main(args) -> None:
         parse_all_atoms_flag = args.ligand_mpnn_use_side_chain_context or (
             args.pack_side_chains and not args.repack_everything
         )
+        if args.decoding_order_from_distances:
+            anchor_spec_raw = _load_str_or_file(args.decoding_order_from_distances)
+            if anchor_spec_raw != "ligand":
+                backbone_atoms = {"N", "CA", "C", "O"}
+                if any(
+                    tok.rsplit("_", 1)[1] not in backbone_atoms
+                    for tok in anchor_spec_raw.split()
+                    if "_" in tok
+                ):
+                    parse_all_atoms_flag = True
         protein_dict, backbone, other_atoms, icodes, _ = parse_PDB(
             pdb,
             device=device,
@@ -411,6 +429,71 @@ def main(args) -> None:
             feature_dict["symmetry_residues"] = remapped_symmetry_residues
             feature_dict["symmetry_weights"] = symmetry_weights
 
+            if args.decoding_order and args.decoding_order_from_distances:
+                raise ValueError(
+                    "--decoding_order and --decoding_order_from_distances are mutually exclusive"
+                )
+
+            # Precompute ordering inputs (once per PDB, before batch loop)
+            base_decoding_scores = None  # used by explicit list mode
+            ca_coords = None             # used by distance mode
+            anchor_coords = None         # used by distance mode
+
+            if args.decoding_order:
+                chain_mask_1d = feature_dict["chain_mask"][0]  # [L]
+                order_tokens = _load_str_or_file(args.decoding_order).split()
+                for tok in order_tokens:
+                    if tok in encoded_residue_dict:
+                        if chain_mask_1d[encoded_residue_dict[tok]].item() == 0.0:
+                            raise ValueError(
+                                f"Residue {tok!r} is fixed and cannot appear in --decoding_order"
+                            )
+                    else:
+                        print(f"Warning: residue {tok!r} not found in structure, skipping")
+                scores = torch.full((L,), float(L + 2), device=device)
+                for rank, tok in enumerate(order_tokens):
+                    if tok in encoded_residue_dict:
+                        scores[encoded_residue_dict[tok]] = float(rank + 1)
+                base_decoding_scores = scores
+
+            elif args.decoding_order_from_distances:
+                ca_coords = protein_dict["X"][:, 1, :]  # [L, 3]
+                anchor_spec = _load_str_or_file(args.decoding_order_from_distances)
+                if anchor_spec == "ligand":
+                    y_m = protein_dict["Y_m"].bool()
+                    anchor_coords = protein_dict["Y"][y_m]  # [A, 3]
+                else:
+                    anchor_coords_list = []
+                    for tok in anchor_spec.split():
+                        res_id, atom_name = tok.rsplit("_", 1)
+                        if res_id in encoded_residue_dict:
+                            res_idx = encoded_residue_dict[res_id]
+                            a_idx = atom_order[atom_name]
+                            if not protein_dict["xyz_37_m"][res_idx, a_idx]:
+                                print(f"Warning: protein atom {tok!r} not present, skipping")
+                                continue
+                            anchor_coords_list.append(protein_dict["xyz_37"][res_idx, a_idx, :])
+                        else:
+                            chain = res_id[0]
+                            try:
+                                resnum = int(res_id[1:])
+                            except ValueError:
+                                resnum = int(res_id[1:-1])
+                            sel = other_atoms.select(
+                                f"chain {chain} and resnum {resnum} and name {atom_name}"
+                            )
+                            if sel is None or len(sel) == 0:
+                                print(f"Warning: atom {tok!r} not found, skipping")
+                                continue
+                            anchor_coords_list.append(
+                                torch.tensor(sel.getCoords()[0], device=device, dtype=torch.float32)
+                            )
+                    if not anchor_coords_list:
+                        raise ValueError(
+                            "No valid anchor atoms found for --decoding_order_from_distances"
+                        )
+                    anchor_coords = torch.stack(anchor_coords_list)  # [A, 3]
+
             sampling_probs_list = []
             log_probs_list = []
             decoding_order_list = []
@@ -419,10 +502,25 @@ def main(args) -> None:
             loss_per_residue_list = []
             loss_XY_list = []
             for _ in range(args.number_of_batches):
-                feature_dict["randn"] = torch.randn(
-                    [feature_dict["batch_size"], feature_dict["mask"].shape[1]],
-                    device=device,
-                )
+                if base_decoding_scores is not None:
+                    feature_dict["randn"] = base_decoding_scores.unsqueeze(0).expand(
+                        feature_dict["batch_size"], -1
+                    )
+                elif ca_coords is not None:
+                    B_curr = feature_dict["batch_size"]
+                    if args.decoding_order_noise > 0.0:
+                        noise = torch.randn([B_curr, L, 3], device=device) * args.decoding_order_noise
+                        noisy_ca = ca_coords.unsqueeze(0) + noise  # [B, L, 3]
+                    else:
+                        noisy_ca = ca_coords.unsqueeze(0).expand(B_curr, -1, -1)
+                    diffs = noisy_ca.unsqueeze(2) - anchor_coords.unsqueeze(0).unsqueeze(0)  # [B, L, A, 3]
+                    dists = torch.norm(diffs, dim=-1)   # [B, L, A]
+                    feature_dict["randn"] = dists.min(dim=-1).values + 1e-4  # [B, L]
+                else:
+                    feature_dict["randn"] = torch.randn(
+                        [feature_dict["batch_size"], feature_dict["mask"].shape[1]],
+                        device=device,
+                    )
                 output_dict = model.sample(feature_dict)
 
                 # compute confidence scores
@@ -853,6 +951,24 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of times to design sequence using a chosen batch size.",
+    )
+    argparser.add_argument(
+        "--decoding_order",
+        type=str,
+        default="",
+        help="Ordered space-separated residue IDs (e.g. 'A15 A16 B42') or path to a text file with the same format. Listed residues are decoded in that order before any unlisted designable residues. Mutually exclusive with --decoding_order_from_distances.",
+    )
+    argparser.add_argument(
+        "--decoding_order_from_distances",
+        type=str,
+        default="",
+        help="Anchor atom specification for distance-based decoding order. Use 'ligand' to anchor on all ligand atoms, or provide space-separated '{chain}{resnum}_{atom_name}' tokens (e.g. 'A15_CA B101_C1') for protein or ligand atoms. A file path containing either format is also accepted. Residues with smaller min-distance to anchors are decoded first. Mutually exclusive with --decoding_order.",
+    )
+    argparser.add_argument(
+        "--decoding_order_noise",
+        type=float,
+        default=0.0,
+        help="Gaussian noise std dev (Angstroms) added to CA coordinates before distance calculation in --decoding_order_from_distances mode. Each batch sample receives independent noise, making the ordering stochastic.",
     )
     argparser.add_argument(
         "--temperature",
