@@ -216,9 +216,21 @@ class ProteinMPNN(torch.nn.Module):
         h_V, h_E, E_idx = self.encode(feature_dict)
 
         chain_mask = mask * chain_mask  # update chain_M to include missing regions
-        decoding_order = torch.argsort(
-            (chain_mask + 0.0001) * (torch.abs(randn))
-        )  # [numbers will be smaller for places where chain_M = 0.0 and higher for places where chain_M = 1.0]
+        if feature_dict.get("decoding_order_from_entropy", False):
+            logits_enc = self.W_out(h_V)                              # [B, L, 21]
+            probs_enc = torch.softmax(logits_enc[:, :, :20], dim=-1)  # drop X token
+            probs_enc = probs_enc / probs_enc.sum(dim=-1, keepdim=True)
+            H = -torch.sum(probs_enc * torch.log(probs_enc + 1e-8), dim=-1)  # [B, L], nats
+            noise_std = feature_dict.get("decoding_order_noise", 0.0)
+            if noise_std > 0.0:
+                H = H + torch.randn([B_decoder, L], device=device) * noise_std  # [B_decoder, L]
+            else:
+                H = H.expand(B_decoder, -1)
+            decoding_order = torch.argsort((chain_mask + 0.0001) * H)
+        else:
+            decoding_order = torch.argsort(
+                (chain_mask + 0.0001) * (torch.abs(randn))
+            )  # [numbers will be smaller for places where chain_M = 0.0 and higher for places where chain_M = 1.0]
 
         max_mutations = feature_dict.get("max_mutations", -1)
         entropy_threshold = feature_dict.get("mutation_entropy_threshold", -1.0)

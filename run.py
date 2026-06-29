@@ -423,6 +423,8 @@ def main(args) -> None:
             feature_dict["temperature"] = args.temperature
             feature_dict["max_mutations"] = args.max_mutations
             feature_dict["mutation_entropy_threshold"] = args.mutation_entropy_threshold
+            feature_dict["decoding_order_from_entropy"] = bool(args.decoding_order_from_entropy)
+            feature_dict["decoding_order_noise"] = args.decoding_order_noise
             feature_dict["bias"] = (
                 (-1e8 * omit_AA[None, None, :] + bias_AA).repeat([1, L, 1])
                 + bias_AA_per_residue[None]
@@ -431,9 +433,9 @@ def main(args) -> None:
             feature_dict["symmetry_residues"] = remapped_symmetry_residues
             feature_dict["symmetry_weights"] = symmetry_weights
 
-            if args.decoding_order and args.decoding_order_from_distances:
+            if sum([bool(args.decoding_order), bool(args.decoding_order_from_distances), bool(args.decoding_order_from_entropy)]) > 1:
                 raise ValueError(
-                    "--decoding_order and --decoding_order_from_distances are mutually exclusive"
+                    "--decoding_order, --decoding_order_from_distances, and --decoding_order_from_entropy are mutually exclusive"
                 )
 
             # Precompute ordering inputs (once per PDB, before batch loop)
@@ -967,10 +969,16 @@ if __name__ == "__main__":
         help="Anchor atom specification for distance-based decoding order. Use 'ligand' to anchor on all ligand atoms, or provide space-separated '{chain}{resnum}_{atom_name}' tokens (e.g. 'A15_CA B101_C1') for protein or ligand atoms. A file path containing either format is also accepted. Residues with smaller min-distance to anchors are decoded first. Mutually exclusive with --decoding_order.",
     )
     argparser.add_argument(
+        "--decoding_order_from_entropy",
+        type=int,
+        default=0,
+        help="1 - sort designable residues by Shannon entropy of the backbone-conditioned amino acid distribution (encoder output, no sequence context), lowest entropy first. Mutually exclusive with --decoding_order and --decoding_order_from_distances.",
+    )
+    argparser.add_argument(
         "--decoding_order_noise",
         type=float,
         default=0.0,
-        help="Gaussian noise std dev (Angstroms) added to CA coordinates before distance calculation in --decoding_order_from_distances mode. Each batch sample receives independent noise, making the ordering stochastic.",
+        help="Noise added to ordering scores to introduce stochasticity. In --decoding_order_from_distances mode: Gaussian std dev in Angstroms added to CA coordinates before distance calculation. In --decoding_order_from_entropy mode: Gaussian std dev in nats added directly to entropy values. Each batch sample receives independent noise.",
     )
     argparser.add_argument(
         "--temperature",
