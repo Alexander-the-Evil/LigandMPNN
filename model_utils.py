@@ -219,6 +219,13 @@ class ProteinMPNN(torch.nn.Module):
         decoding_order = torch.argsort(
             (chain_mask + 0.0001) * (torch.abs(randn))
         )  # [numbers will be smaller for places where chain_M = 0.0 and higher for places where chain_M = 1.0]
+
+        max_mutations = feature_dict.get("max_mutations", -1)
+        entropy_threshold = feature_dict.get("mutation_entropy_threshold", -1.0)
+        use_mutation_control = (max_mutations >= 0) or (entropy_threshold >= 0.0)
+        if use_mutation_control:
+            mutations_count = torch.zeros(B_decoder, dtype=torch.long, device=device)
+
         if len(symmetry_list_of_lists[0]) == 0 and len(symmetry_list_of_lists) == 1:
             E_idx = E_idx.repeat(B_decoder, 1, 1)
             permutation_matrix_reverse = torch.nn.functional.one_hot(
@@ -334,7 +341,18 @@ class ProteinMPNN(torch.nn.Module):
                     (chain_mask_t[:, None, None] * log_probs[:, None, :]).float(),
                 )
                 S_true_t = torch.gather(S_true, 1, t[:, None])[:, 0]
-                S_t = (S_t * chain_mask_t + S_true_t * (1.0 - chain_mask_t)).long()
+                if use_mutation_control:
+                    can_mutate = chain_mask_t.clone()  # [B], float
+                    if entropy_threshold >= 0.0:
+                        H = -torch.sum(probs_sample * torch.log(probs_sample + 1e-8), dim=-1)  # [B]
+                        can_mutate = can_mutate * (H < entropy_threshold).float()
+                    if max_mutations >= 0:
+                        can_mutate = can_mutate * (mutations_count < max_mutations).float()
+                    is_actual_mutation = (S_t != S_true_t).float() * can_mutate  # [B]
+                    mutations_count = mutations_count + is_actual_mutation.long()
+                    S_t = (S_t * can_mutate + S_true_t * (1.0 - can_mutate)).long()
+                else:
+                    S_t = (S_t * chain_mask_t + S_true_t * (1.0 - chain_mask_t)).long()
                 h_S.scatter_(
                     1,
                     t[:, None, None].repeat(1, 1, h_S.shape[-1]),
@@ -456,7 +474,18 @@ class ProteinMPNN(torch.nn.Module):
                         chain_mask_t[:, None] * probs_sample
                     ).float()  # [B,20]
                     S_true_t = S_true[:, t]  # [B]
-                    S_t = (S_t * chain_mask_t + S_true_t * (1.0 - chain_mask_t)).long()
+                    if use_mutation_control:
+                        can_mutate = chain_mask_t.clone()  # [B], float
+                        if entropy_threshold >= 0.0:
+                            H = -torch.sum(probs_sample * torch.log(probs_sample + 1e-8), dim=-1)
+                            can_mutate = can_mutate * (H < entropy_threshold).float()
+                        if max_mutations >= 0:
+                            can_mutate = can_mutate * (mutations_count < max_mutations).float()
+                        is_actual_mutation = (S_t != S_true_t).float() * can_mutate
+                        mutations_count = mutations_count + is_actual_mutation.long()
+                        S_t = (S_t * can_mutate + S_true_t * (1.0 - can_mutate)).long()
+                    else:
+                        S_t = (S_t * chain_mask_t + S_true_t * (1.0 - chain_mask_t)).long()
                     h_S[:, t] = self.W_s(S_t)
                     S[:, t] = S_t
 
@@ -499,7 +528,7 @@ class ProteinMPNN(torch.nn.Module):
             E_idx = torch.clone(E_idx_enc)
             mask = torch.clone(mask_enc)
             S_true = torch.clone(S_true_enc)
-            if not use_sequence:
+            if use_sequence:
                 order_mask = torch.zeros(chain_mask_enc.shape[1], device=device).float()
                 order_mask[idx] = 1.
             else:

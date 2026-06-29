@@ -421,6 +421,8 @@ def main(args) -> None:
             B, L, _, _ = feature_dict["X"].shape  # batch size should be 1 for now.
             # add additional keys to the feature dictionary
             feature_dict["temperature"] = args.temperature
+            feature_dict["max_mutations"] = args.max_mutations
+            feature_dict["mutation_entropy_threshold"] = args.mutation_entropy_threshold
             feature_dict["bias"] = (
                 (-1e8 * omit_AA[None, None, :] + bias_AA).repeat([1, L, 1])
                 + bias_AA_per_residue[None]
@@ -975,6 +977,18 @@ if __name__ == "__main__":
         type=float,
         default=0.1,
         help="Temperature to sample sequences.",
+    )
+    argparser.add_argument(
+        "--max_mutations",
+        type=int,
+        default=-1,
+        help="Maximum number of mutations (substitutions relative to native) per designed sequence. -1 disables the cap. Positions are considered in decoding order, so combining with --decoding_order_from_distances controls where mutations land.",
+    )
+    argparser.add_argument(
+        "--mutation_entropy_threshold",
+        type=float,
+        default=-1.0,
+        help="Only accept a mutation at a position if the Shannon entropy of the model's probability distribution (in nats) is below this threshold. Filters out positions where the model is uncertain. Range: 0 (certain) to ~3.0 (uniform over 20 AA). -1 disables the filter.",
     )
     argparser.add_argument(
         "--save_stats", type=int, default=0, help="Save output statistics"
