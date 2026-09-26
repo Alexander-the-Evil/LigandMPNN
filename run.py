@@ -10,6 +10,7 @@ import torch
 from data_utils import (
     alphabet,
     atom_order,
+    build_ligand_group_mask,
     element_dict_rev,
     featurize,
     get_score,
@@ -59,6 +60,9 @@ def main(args) -> None:
     if args.save_stats:
         if not os.path.exists(base_folder + "stats"):
             os.makedirs(base_folder + "stats", exist_ok=True)
+    if args.save_decoding_order:
+        if not os.path.exists(base_folder + "decoding_order"):
+            os.makedirs(base_folder + "decoding_order", exist_ok=True)
     if args.model_type == "protein_mpnn":
         checkpoint_path = args.checkpoint_protein_mpnn
     elif args.model_type == "ligand_mpnn":
@@ -151,6 +155,20 @@ def main(args) -> None:
         for pdb in pdb_paths:
             redesigned_residues_multi[pdb] = redesigned_residues
 
+    if args.conditional_group_multi:
+        with open(args.conditional_group_multi, "r") as fh:
+            conditional_group_multi = json.load(fh)
+            conditional_group_multi = {key: value.split() for key, value in conditional_group_multi.items()}
+    else:
+        conditional_group_tokens = (
+            _load_str_or_file(args.conditional_group).split()
+            if args.conditional_group
+            else []
+        )
+        conditional_group_multi = {}
+        for pdb in pdb_paths:
+            conditional_group_multi[pdb] = conditional_group_tokens
+
     bias_AA = torch.zeros([21], device=device, dtype=torch.float32)
     if args.bias_AA:
         tmp = [item.split(":") for item in args.bias_AA.split(",")]
@@ -202,6 +220,17 @@ def main(args) -> None:
             print("Designing protein from this path:", pdb)
         fixed_residues = fixed_residues_multi[pdb]
         redesigned_residues = redesigned_residues_multi[pdb]
+        conditional_group_tokens = conditional_group_multi[pdb]
+        if conditional_group_tokens and args.model_type != "ligand_mpnn":
+            raise ValueError(
+                "--conditional_group is only supported with --model_type ligand_mpnn"
+            )
+        if conditional_group_tokens and (
+            args.symmetry_residues or args.symmetry_weights
+        ):
+            raise ValueError(
+                "--conditional_group is mutually exclusive with --symmetry_residues"
+            )
         parse_all_atoms_flag = args.ligand_mpnn_use_side_chain_context or (
             args.pack_side_chains and not args.repack_everything
         )
@@ -419,11 +448,31 @@ def main(args) -> None:
             )
             feature_dict["batch_size"] = args.batch_size
             B, L, _, _ = feature_dict["X"].shape  # batch size should be 1 for now.
+            if conditional_group_tokens:
+                group_mask = build_ligand_group_mask(
+                    other_atoms, protein_dict["Y_t"], conditional_group_tokens
+                )
+                alt_protein_dict = dict(protein_dict)
+                alt_protein_dict["Y_m"] = protein_dict["Y_m"] * (
+                    ~group_mask
+                ).to(protein_dict["Y_m"].dtype)
+                alt_feature_dict = featurize(
+                    alt_protein_dict,
+                    cutoff_for_score=args.ligand_mpnn_cutoff_for_score,
+                    use_atom_context=args.ligand_mpnn_use_atom_context,
+                    number_of_ligand_atoms=atom_context_num,
+                    model_type=args.model_type,
+                )
+                feature_dict["Y_no_group"] = alt_feature_dict["Y"]
+                feature_dict["Y_t_no_group"] = alt_feature_dict["Y_t"]
+                feature_dict["Y_m_no_group"] = alt_feature_dict["Y_m"]
+                feature_dict["conditional_group_scale"] = args.conditional_group_scale
             # add additional keys to the feature dictionary
             feature_dict["temperature"] = args.temperature
             feature_dict["max_mutations"] = args.max_mutations
             feature_dict["mutation_entropy_threshold"] = args.mutation_entropy_threshold
             feature_dict["decoding_order_from_entropy"] = bool(args.decoding_order_from_entropy)
+            feature_dict["full_sequence_context"] = bool(args.full_sequence_context)
             feature_dict["decoding_order_noise"] = args.decoding_order_noise
             feature_dict["bias"] = (
                 (-1e8 * omit_AA[None, None, :] + bias_AA).repeat([1, L, 1])
@@ -519,7 +568,13 @@ def main(args) -> None:
                         noisy_ca = ca_coords.unsqueeze(0).expand(B_curr, -1, -1)
                     diffs = noisy_ca.unsqueeze(2) - anchor_coords.unsqueeze(0).unsqueeze(0)  # [B, L, A, 3]
                     dists = torch.norm(diffs, dim=-1)   # [B, L, A]
-                    feature_dict["randn"] = dists.min(dim=-1).values + 1e-4  # [B, L]
+                    dists_min = dists.min(dim=-1).values  # [B, L]
+                    if args.decoding_order_reverse:
+                        # farthest-first: remap to (per-sample max - dist), still >= 0 so the
+                        # model's downstream abs() is a no-op, and ascending-argsort on this
+                        # equals descending-argsort on the original distance.
+                        dists_min = dists_min.max(dim=1, keepdim=True).values - dists_min
+                    feature_dict["randn"] = dists_min + 1e-4  # [B, L]
                 else:
                     feature_dict["randn"] = torch.randn(
                         [feature_dict["batch_size"], feature_dict["mask"].shape[1]],
@@ -576,6 +631,7 @@ def main(args) -> None:
             output_backbones = base_folder + "/backbones/"
             output_packed = base_folder + "/packed/"
             output_stats_path = base_folder + "stats/" + name + args.file_ending + ".pt"
+            output_decoding_order_path = base_folder + "decoding_order/" + name + args.file_ending + ".pt"
 
             out_dict = {}
             out_dict["generated_sequences"] = S_stack.cpu()
@@ -589,6 +645,12 @@ def main(args) -> None:
             out_dict["temperature"] = args.temperature
             if args.save_stats:
                 torch.save(out_dict, output_stats_path)
+            if args.save_decoding_order:
+                torch.save(
+                    {"decoding_order": decoding_order_stack.cpu(),
+                     "chain_mask": feature_dict["chain_mask"][0].cpu()},
+                    output_decoding_order_path,
+                )
 
             if args.pack_side_chains:
                 if args.verbose:
@@ -975,10 +1037,40 @@ if __name__ == "__main__":
         help="1 - sort designable residues by Shannon entropy of the backbone-conditioned amino acid distribution (encoder output, no sequence context), lowest entropy first. Mutually exclusive with --decoding_order and --decoding_order_from_distances.",
     )
     argparser.add_argument(
+        "--full_sequence_context",
+        type=int,
+        default=0,
+        help="1 - represent not-yet-decoded positions to the decoder using their native sequence identity (from the input structure) instead of the default zero/unknown placeholder. Off by default: this exposes real sequence information for autoregressive positions that were always masked out during training, so it is an out-of-distribution input relative to how the model was trained. Early-decoded positions will see mostly native neighbor identities; later positions see a mix of native (not yet reached) and freshly sampled (already decided) neighbor identities.",
+    )
+    argparser.add_argument(
+        "--conditional_group",
+        type=str,
+        default="",
+        help="Space-separated ligand residue IDs (e.g. 'B401 B402') naming a ligand group, or path to a text file with the same format. At each decoding step probabilities are computed with and without this group's ligand context; the without-group run is treated as a prior and the with-group run reweights it via classifier-free guidance (see --conditional_group_scale). Only supported for --model_type ligand_mpnn. Mutually exclusive with --symmetry_residues.",
+    )
+    argparser.add_argument(
+        "--conditional_group_multi",
+        type=str,
+        default="",
+        help="Path to a JSON file: {'pdb_path': '<conditional_group string>'} for multi-PDB batch runs.",
+    )
+    argparser.add_argument(
+        "--conditional_group_scale",
+        type=float,
+        default=3.0,
+        help="Guidance scale for --conditional_group: logits_final = logits_prior + scale*(logits_with_group - logits_prior). 0 ignores the group, 1 uses plain with-group logits, >1 amplifies the group's effect.",
+    )
+    argparser.add_argument(
         "--decoding_order_noise",
         type=float,
         default=0.0,
         help="Noise added to ordering scores to introduce stochasticity. In --decoding_order_from_distances mode: Gaussian std dev in Angstroms added to CA coordinates before distance calculation. In --decoding_order_from_entropy mode: Gaussian std dev in nats added directly to entropy values. Each batch sample receives independent noise.",
+    )
+    argparser.add_argument(
+        "--decoding_order_reverse",
+        type=int,
+        default=0,
+        help="1 - reverse the priority order for --decoding_order_from_distances only (farthest-from-anchor decoded first instead of nearest-first). Test/ablation flag. No effect on --decoding_order_from_entropy or --decoding_order (explicit list). Implemented by remapping each sample's per-position distances to (per-sample max distance - distance) before the model's own argsort(abs(randn)) step -- still non-negative, so the abs() is a no-op, and ascending-sort on the remapped value is descending-sort on the original distance.",
     )
     argparser.add_argument(
         "--temperature",
@@ -1000,6 +1092,11 @@ if __name__ == "__main__":
     )
     argparser.add_argument(
         "--save_stats", type=int, default=0, help="Save output statistics"
+    )
+    argparser.add_argument(
+        "--save_decoding_order", type=int, default=0,
+        help="1 - save only the per-sample decoding order (lightweight: no probability tensors, "
+             "unlike --save_stats) to out_folder/decoding_order/{name}.pt",
     )
 
     argparser.add_argument(

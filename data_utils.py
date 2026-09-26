@@ -923,6 +923,40 @@ def get_nearest_neighbours(CB, mask, Y, Y_t, Y_m, number_of_ligand_atoms):
     return Y, Y_t, Y_m, D_AB_closest
 
 
+def build_ligand_group_mask(other_atoms, Y_t, group_tokens):
+    """Boolean mask, True for ligand atoms (rows of Y/Y_t/Y_m) belonging to
+    one of the given "<chain><resnum>" tokens. Row order/count must match
+    parse_PDB's filtering of other_atoms (drop H and unknown-element atoms)."""
+    element_dict = dict(zip(element_list, range(1, len(element_list))))
+    Y_t_raw = list(other_atoms.getElements())
+    Y_t_raw = np.array(
+        [
+            element_dict[y_t.upper()] if y_t.upper() in element_list else 0
+            for y_t in Y_t_raw
+        ],
+        dtype=np.int32,
+    )
+    elem_mask = (Y_t_raw != 1) & (Y_t_raw != 0)
+
+    chids = np.array(other_atoms.getChids())[elem_mask]
+    resnums = np.array(other_atoms.getResnums())[elem_mask]
+    tokens = np.array([f"{c}{r}" for c, r in zip(chids, resnums)])
+
+    if len(tokens) != len(Y_t):
+        raise ValueError(
+            "build_ligand_group_mask: filtered other_atoms length does not "
+            "match Y_t; cannot align ligand group tokens to atom rows."
+        )
+
+    group_tokens = set(group_tokens)
+    found_tokens = set(tokens) & group_tokens
+    for tok in group_tokens - found_tokens:
+        print(f"Warning: conditional group residue {tok!r} not found among ligand atoms, skipping")
+
+    group_mask = np.isin(tokens, list(group_tokens))
+    return torch.tensor(group_mask, dtype=torch.bool, device=Y_t.device)
+
+
 def featurize(
     input_dict,
     cutoff_for_score=8.0,

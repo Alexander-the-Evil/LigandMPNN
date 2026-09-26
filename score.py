@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from data_utils import (
+    build_ligand_group_mask,
     element_dict_rev,
     alphabet,
     restype_int_to_str,
@@ -15,6 +16,13 @@ from data_utils import (
     parse_PDB,
 )
 from model_utils import ProteinMPNN
+
+
+def _load_str_or_file(arg):
+    if os.path.isfile(arg):
+        with open(arg) as f:
+            return f.read().strip()
+    return arg.strip()
 
 
 def main(args) -> None:
@@ -99,12 +107,35 @@ def main(args) -> None:
         for pdb in pdb_paths:
             redesigned_residues_multi[pdb] = redesigned_residues
 
+    if args.conditional_group_multi:
+        with open(args.conditional_group_multi, "r") as fh:
+            conditional_group_multi = json.load(fh)
+            conditional_group_multi = {key: value.split() for key, value in conditional_group_multi.items()}
+    else:
+        conditional_group_tokens = (
+            _load_str_or_file(args.conditional_group).split()
+            if args.conditional_group
+            else []
+        )
+        conditional_group_multi = {}
+        for pdb in pdb_paths:
+            conditional_group_multi[pdb] = conditional_group_tokens
+
     # loop over PDB paths
     for pdb in pdb_paths:
         if args.verbose:
             print("Designing protein from this path:", pdb)
         fixed_residues = fixed_residues_multi[pdb]
         redesigned_residues = redesigned_residues_multi[pdb]
+        conditional_group_tokens = conditional_group_multi[pdb]
+        if conditional_group_tokens and args.model_type != "ligand_mpnn":
+            raise ValueError(
+                "--conditional_group is only supported with --model_type ligand_mpnn"
+            )
+        if conditional_group_tokens and args.symmetry_residues:
+            raise ValueError(
+                "--conditional_group is mutually exclusive with --symmetry_residues"
+            )
         protein_dict, backbone, other_atoms, icodes, _ = parse_PDB(
             pdb,
             device=device,
@@ -271,6 +302,25 @@ def main(args) -> None:
             )
             feature_dict["batch_size"] = args.batch_size
             B, L, _, _ = feature_dict["X"].shape  # batch size should be 1 for now.
+            if conditional_group_tokens:
+                group_mask = build_ligand_group_mask(
+                    other_atoms, protein_dict["Y_t"], conditional_group_tokens
+                )
+                alt_protein_dict = dict(protein_dict)
+                alt_protein_dict["Y_m"] = protein_dict["Y_m"] * (
+                    ~group_mask
+                ).to(protein_dict["Y_m"].dtype)
+                alt_feature_dict = featurize(
+                    alt_protein_dict,
+                    cutoff_for_score=args.ligand_mpnn_cutoff_for_score,
+                    use_atom_context=args.ligand_mpnn_use_atom_context,
+                    number_of_ligand_atoms=atom_context_num,
+                    model_type=args.model_type,
+                )
+                feature_dict["Y_no_group"] = alt_feature_dict["Y"]
+                feature_dict["Y_t_no_group"] = alt_feature_dict["Y_t"]
+                feature_dict["Y_m_no_group"] = alt_feature_dict["Y_m"]
+                feature_dict["conditional_group_scale"] = args.conditional_group_scale
             # add additional keys to the feature dictionary
             feature_dict["symmetry_residues"] = remapped_symmetry_residues
 
@@ -421,7 +471,26 @@ if __name__ == "__main__":
         default="",
         help="Add list of lists for which residues need to be symmetric, e.g. 'A12,A13,A14|C2,C3|A5,B6'",
     )
-    
+
+    argparser.add_argument(
+        "--conditional_group",
+        type=str,
+        default="",
+        help="Space-separated ligand residue IDs (e.g. 'B401 B402') naming a ligand group, or path to a text file with the same format. Probabilities are computed with and without this group's ligand context; the without-group run is treated as a prior and the with-group run reweights it via classifier-free guidance (see --conditional_group_scale). Only supported for --model_type ligand_mpnn. Mutually exclusive with --symmetry_residues.",
+    )
+    argparser.add_argument(
+        "--conditional_group_multi",
+        type=str,
+        default="",
+        help="Path to a JSON file: {'pdb_path': '<conditional_group string>'} for multi-PDB batch runs.",
+    )
+    argparser.add_argument(
+        "--conditional_group_scale",
+        type=float,
+        default=3.0,
+        help="Guidance scale for --conditional_group: logits_final = logits_prior + scale*(logits_with_group - logits_prior). 0 ignores the group, 1 uses plain with-group logits, >1 amplifies the group's effect.",
+    )
+
     argparser.add_argument(
         "--homo_oligomer",
         type=int,

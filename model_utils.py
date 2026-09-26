@@ -215,6 +215,15 @@ class ProteinMPNN(torch.nn.Module):
 
         h_V, h_E, E_idx = self.encode(feature_dict)
 
+        use_cond_group = "Y_no_group" in feature_dict
+        if use_cond_group:
+            alt_feature_dict = dict(feature_dict)
+            alt_feature_dict["Y"] = feature_dict["Y_no_group"]
+            alt_feature_dict["Y_t"] = feature_dict["Y_t_no_group"]
+            alt_feature_dict["Y_m"] = feature_dict["Y_m_no_group"]
+            h_V_prior, _, _ = self.encode(alt_feature_dict)  # h_E/E_idx are ligand-independent, reuse
+            cg_scale = feature_dict.get("conditional_group_scale", 1.0)
+
         chain_mask = mask * chain_mask  # update chain_M to include missing regions
         if feature_dict.get("decoding_order_from_entropy", False):
             logits_enc = self.W_out(h_V)                              # [B, L, 21]
@@ -237,6 +246,14 @@ class ProteinMPNN(torch.nn.Module):
         use_mutation_control = (max_mutations >= 0) or (entropy_threshold >= 0.0)
         if use_mutation_control:
             mutations_count = torch.zeros(B_decoder, dtype=torch.long, device=device)
+
+        symmetric_design = not (
+            len(symmetry_list_of_lists[0]) == 0 and len(symmetry_list_of_lists) == 1
+        )
+        if use_cond_group and symmetric_design:
+            raise NotImplementedError(
+                "conditional_group (Y_no_group) is not supported together with symmetry_residues"
+            )
 
         if len(symmetry_list_of_lists[0]) == 0 and len(symmetry_list_of_lists) == 1:
             E_idx = E_idx.repeat(B_decoder, 1, 1)
@@ -275,9 +292,21 @@ class ProteinMPNN(torch.nn.Module):
                 for _ in range(len(self.decoder_layers))
             ]
 
-            h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
+            if feature_dict.get("full_sequence_context", False):
+                h_EX_encoder = cat_neighbors_nodes(self.W_s(S_true), h_E, E_idx)
+            else:
+                h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
             h_EXV_encoder = cat_neighbors_nodes(h_V, h_EX_encoder, E_idx)
             h_EXV_encoder_fw = mask_fw * h_EXV_encoder
+
+            if use_cond_group:
+                h_V_prior = h_V_prior.repeat(B_decoder, 1, 1)
+                h_V_stack_prior = [h_V_prior] + [
+                    torch.zeros_like(h_V_prior, device=device)
+                    for _ in range(len(self.decoder_layers))
+                ]
+                h_EXV_encoder_prior = cat_neighbors_nodes(h_V_prior, h_EX_encoder, E_idx)
+                h_EXV_encoder_fw_prior = mask_fw * h_EXV_encoder_prior
 
             for t_ in range(L):
                 t = decoding_order[:, t_]  # [B]
@@ -332,6 +361,38 @@ class ProteinMPNN(torch.nn.Module):
                     t[:, None, None].repeat(1, 1, h_V_stack[-1].shape[-1]),
                 )[:, 0]
                 logits = self.W_out(h_V_t)  # [B,21]
+
+                if use_cond_group:
+                    h_EXV_encoder_t_prior = torch.gather(
+                        h_EXV_encoder_fw_prior,
+                        1,
+                        t[:, None, None, None].repeat(
+                            1, 1, h_EXV_encoder_fw_prior.shape[-2], h_EXV_encoder_fw_prior.shape[-1]
+                        ),
+                    )
+                    for l, layer in enumerate(self.decoder_layers):
+                        h_ESV_decoder_t_prior = cat_neighbors_nodes(
+                            h_V_stack_prior[l], h_ES_t, E_idx_t
+                        )
+                        h_V_t_prior = torch.gather(
+                            h_V_stack_prior[l],
+                            1,
+                            t[:, None, None].repeat(1, 1, h_V_stack_prior[l].shape[-1]),
+                        )
+                        h_ESV_t_prior = mask_bw_t * h_ESV_decoder_t_prior + h_EXV_encoder_t_prior
+                        h_V_stack_prior[l + 1].scatter_(
+                            1,
+                            t[:, None, None].repeat(1, 1, h_V_prior.shape[-1]),
+                            layer(h_V_t_prior, h_ESV_t_prior, mask_V=mask_t),
+                        )
+                    h_V_t_prior = torch.gather(
+                        h_V_stack_prior[-1],
+                        1,
+                        t[:, None, None].repeat(1, 1, h_V_stack_prior[-1].shape[-1]),
+                    )[:, 0]
+                    logits_prior = self.W_out(h_V_t_prior)  # [B,21]
+                    logits = logits_prior + cg_scale * (logits - logits_prior)
+
                 log_probs = torch.nn.functional.log_softmax(logits, dim=-1)  # [B,21]
 
                 probs = torch.nn.functional.softmax(
@@ -436,7 +497,10 @@ class ProteinMPNN(torch.nn.Module):
                 for _ in range(len(self.decoder_layers))
             ]
 
-            h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
+            if feature_dict.get("full_sequence_context", False):
+                h_EX_encoder = cat_neighbors_nodes(self.W_s(S_true), h_E, E_idx)
+            else:
+                h_EX_encoder = cat_neighbors_nodes(torch.zeros_like(h_S), h_E, E_idx)
             h_EXV_encoder = cat_neighbors_nodes(h_V, h_EX_encoder, E_idx)
             h_EXV_encoder_fw = mask_fw * h_EXV_encoder
 
@@ -531,6 +595,16 @@ class ProteinMPNN(torch.nn.Module):
         device = S_true_enc.device
 
         h_V_enc, h_E_enc, E_idx_enc = self.encode(feature_dict)
+
+        use_cond_group = "Y_no_group" in feature_dict
+        if use_cond_group:
+            alt_feature_dict = dict(feature_dict)
+            alt_feature_dict["Y"] = feature_dict["Y_no_group"]
+            alt_feature_dict["Y_t"] = feature_dict["Y_t_no_group"]
+            alt_feature_dict["Y_m"] = feature_dict["Y_m_no_group"]
+            h_V_enc_prior, _, _ = self.encode(alt_feature_dict)  # h_E/E_idx are ligand-independent, reuse
+            cg_scale = feature_dict.get("conditional_group_scale", 1.0)
+
         log_probs_out = torch.zeros([B_decoder, L, 21], device=device).float()
         logits_out = torch.zeros([B_decoder, L, 21], device=device).float()
         decoding_order_out = torch.zeros([B_decoder, L, L], device=device).float()
@@ -583,8 +657,20 @@ class ProteinMPNN(torch.nn.Module):
                 h_V = layer(h_V, h_ESV, mask)
 
             logits = self.W_out(h_V)
+
+            if use_cond_group:
+                h_V_prior = torch.clone(h_V_enc_prior).repeat(B_decoder, 1, 1)
+                h_EXV_encoder_prior = cat_neighbors_nodes(h_V_prior, h_EX_encoder, E_idx)
+                h_EXV_encoder_fw_prior = mask_fw * h_EXV_encoder_prior
+                for layer in self.decoder_layers:
+                    h_ESV_prior = cat_neighbors_nodes(h_V_prior, h_ES, E_idx)
+                    h_ESV_prior = mask_bw * h_ESV_prior + h_EXV_encoder_fw_prior
+                    h_V_prior = layer(h_V_prior, h_ESV_prior, mask)
+                logits_prior = self.W_out(h_V_prior)
+                logits = logits_prior + cg_scale * (logits - logits_prior)
+
             log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-            
+
             log_probs_out[:,idx,:] = log_probs[:,idx,:]
             logits_out[:,idx,:] = logits[:,idx,:]
             decoding_order_out[:,idx,:] = decoding_order
@@ -619,6 +705,21 @@ class ProteinMPNN(torch.nn.Module):
         device = S_true.device
 
         h_V, h_E, E_idx = self.encode(feature_dict)
+
+        use_cond_group = "Y_no_group" in feature_dict
+        if use_cond_group:
+            alt_feature_dict = dict(feature_dict)
+            alt_feature_dict["Y"] = feature_dict["Y_no_group"]
+            alt_feature_dict["Y_t"] = feature_dict["Y_t_no_group"]
+            alt_feature_dict["Y_m"] = feature_dict["Y_m_no_group"]
+            h_V_prior, _, _ = self.encode(alt_feature_dict)  # h_E/E_idx are ligand-independent, reuse
+            cg_scale = feature_dict.get("conditional_group_scale", 1.0)
+            if not (
+                len(symmetry_list_of_lists[0]) == 0 and len(symmetry_list_of_lists) == 1
+            ):
+                raise NotImplementedError(
+                    "conditional_group (Y_no_group) is not supported together with symmetry_residues"
+                )
 
         chain_mask = mask * chain_mask  # update chain_M to include missing regions
         decoding_order = torch.argsort(
@@ -687,7 +788,7 @@ class ProteinMPNN(torch.nn.Module):
         h_EXV_encoder_fw = mask_fw * h_EXV_encoder
         if not use_sequence:
             for layer in self.decoder_layers:
-                h_V = layer(h_V, h_EXV_encoder_fw, mask)          
+                h_V = layer(h_V, h_EXV_encoder_fw, mask)
         else:
             for layer in self.decoder_layers:
                 # Masked positions attend to encoder information, unmasked see.
@@ -696,6 +797,22 @@ class ProteinMPNN(torch.nn.Module):
                 h_V = layer(h_V, h_ESV, mask)
 
         logits = self.W_out(h_V)
+
+        if use_cond_group:
+            h_V_prior = h_V_prior.repeat(B_decoder, 1, 1)
+            h_EXV_encoder_prior = cat_neighbors_nodes(h_V_prior, h_EX_encoder, E_idx)
+            h_EXV_encoder_fw_prior = mask_fw * h_EXV_encoder_prior
+            if not use_sequence:
+                for layer in self.decoder_layers:
+                    h_V_prior = layer(h_V_prior, h_EXV_encoder_fw_prior, mask)
+            else:
+                for layer in self.decoder_layers:
+                    h_ESV_prior = cat_neighbors_nodes(h_V_prior, h_ES, E_idx)
+                    h_ESV_prior = mask_bw * h_ESV_prior + h_EXV_encoder_fw_prior
+                    h_V_prior = layer(h_V_prior, h_ESV_prior, mask)
+            logits_prior = self.W_out(h_V_prior)
+            logits = logits_prior + cg_scale * (logits - logits_prior)
+
         log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
 
         output_dict = {
