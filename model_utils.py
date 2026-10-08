@@ -215,12 +215,20 @@ class ProteinMPNN(torch.nn.Module):
 
         h_V, h_E, E_idx = self.encode(feature_dict)
 
-        use_cond_group = "Y_no_group" in feature_dict
+        use_cond_group = ("Y_no_group" in feature_dict) or ("mask_no_group" in feature_dict)
         if use_cond_group:
             alt_feature_dict = dict(feature_dict)
-            alt_feature_dict["Y"] = feature_dict["Y_no_group"]
-            alt_feature_dict["Y_t"] = feature_dict["Y_t_no_group"]
-            alt_feature_dict["Y_m"] = feature_dict["Y_m_no_group"]
+            if "Y_no_group" in feature_dict:
+                alt_feature_dict["Y"] = feature_dict["Y_no_group"]
+                alt_feature_dict["Y_t"] = feature_dict["Y_t_no_group"]
+                alt_feature_dict["Y_m"] = feature_dict["Y_m_no_group"]
+            if "mask_no_group" in feature_dict:
+                # Whole-chain ablation: zero mask for the conditioned-out chain's
+                # residues so ProteinFeatures._dist pushes their distance to every
+                # other residue to that row's max before the top-k neighbor search,
+                # excluding them from the K-NN graph entirely -- same mechanism as
+                # any other masked residue, no new leakage path (X/S untouched).
+                alt_feature_dict["mask"] = feature_dict["mask_no_group"]
             h_V_prior, _, _ = self.encode(alt_feature_dict)  # h_E/E_idx are ligand-independent, reuse
             cg_scale = feature_dict.get("conditional_group_scale", 1.0)
 
@@ -252,7 +260,7 @@ class ProteinMPNN(torch.nn.Module):
         )
         if use_cond_group and symmetric_design:
             raise NotImplementedError(
-                "conditional_group (Y_no_group) is not supported together with symmetry_residues"
+                "conditional_group is not supported together with symmetry_residues"
             )
 
         if len(symmetry_list_of_lists[0]) == 0 and len(symmetry_list_of_lists) == 1:
@@ -596,12 +604,20 @@ class ProteinMPNN(torch.nn.Module):
 
         h_V_enc, h_E_enc, E_idx_enc = self.encode(feature_dict)
 
-        use_cond_group = "Y_no_group" in feature_dict
+        use_cond_group = ("Y_no_group" in feature_dict) or ("mask_no_group" in feature_dict)
         if use_cond_group:
             alt_feature_dict = dict(feature_dict)
-            alt_feature_dict["Y"] = feature_dict["Y_no_group"]
-            alt_feature_dict["Y_t"] = feature_dict["Y_t_no_group"]
-            alt_feature_dict["Y_m"] = feature_dict["Y_m_no_group"]
+            if "Y_no_group" in feature_dict:
+                alt_feature_dict["Y"] = feature_dict["Y_no_group"]
+                alt_feature_dict["Y_t"] = feature_dict["Y_t_no_group"]
+                alt_feature_dict["Y_m"] = feature_dict["Y_m_no_group"]
+            if "mask_no_group" in feature_dict:
+                # Whole-chain ablation: zero mask for the conditioned-out chain's
+                # residues so ProteinFeatures._dist pushes their distance to every
+                # other residue to that row's max before the top-k neighbor search,
+                # excluding them from the K-NN graph entirely -- same mechanism as
+                # any other masked residue, no new leakage path (X/S untouched).
+                alt_feature_dict["mask"] = feature_dict["mask_no_group"]
             h_V_enc_prior, _, _ = self.encode(alt_feature_dict)  # h_E/E_idx are ligand-independent, reuse
             cg_scale = feature_dict.get("conditional_group_scale", 1.0)
 
@@ -706,19 +722,27 @@ class ProteinMPNN(torch.nn.Module):
 
         h_V, h_E, E_idx = self.encode(feature_dict)
 
-        use_cond_group = "Y_no_group" in feature_dict
+        use_cond_group = ("Y_no_group" in feature_dict) or ("mask_no_group" in feature_dict)
         if use_cond_group:
             alt_feature_dict = dict(feature_dict)
-            alt_feature_dict["Y"] = feature_dict["Y_no_group"]
-            alt_feature_dict["Y_t"] = feature_dict["Y_t_no_group"]
-            alt_feature_dict["Y_m"] = feature_dict["Y_m_no_group"]
+            if "Y_no_group" in feature_dict:
+                alt_feature_dict["Y"] = feature_dict["Y_no_group"]
+                alt_feature_dict["Y_t"] = feature_dict["Y_t_no_group"]
+                alt_feature_dict["Y_m"] = feature_dict["Y_m_no_group"]
+            if "mask_no_group" in feature_dict:
+                # Whole-chain ablation: zero mask for the conditioned-out chain's
+                # residues so ProteinFeatures._dist pushes their distance to every
+                # other residue to that row's max before the top-k neighbor search,
+                # excluding them from the K-NN graph entirely -- same mechanism as
+                # any other masked residue, no new leakage path (X/S untouched).
+                alt_feature_dict["mask"] = feature_dict["mask_no_group"]
             h_V_prior, _, _ = self.encode(alt_feature_dict)  # h_E/E_idx are ligand-independent, reuse
             cg_scale = feature_dict.get("conditional_group_scale", 1.0)
             if not (
                 len(symmetry_list_of_lists[0]) == 0 and len(symmetry_list_of_lists) == 1
             ):
                 raise NotImplementedError(
-                    "conditional_group (Y_no_group) is not supported together with symmetry_residues"
+                    "conditional_group is not supported together with symmetry_residues"
                 )
 
         chain_mask = mask * chain_mask  # update chain_M to include missing regions

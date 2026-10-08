@@ -957,6 +957,22 @@ def build_ligand_group_mask(other_atoms, Y_t, group_tokens):
     return torch.tensor(group_mask, dtype=torch.bool, device=Y_t.device)
 
 
+def build_chain_group_mask(chain_letters, chain_tokens, device):
+    """Boolean mask, True for protein residues (rows of X/mask/S/R_idx/etc.)
+    belonging to one of the given whole-chain-letter tokens (e.g. {"B"}).
+    Unlike build_ligand_group_mask, this masks entire protein chains for the
+    --conditional_group backbone-ablation path (see model_utils.encode's
+    "mask_no_group"), not individual ligand atoms."""
+    chain_letters = np.asarray(chain_letters)
+    chain_tokens = set(chain_tokens)
+    found_tokens = set(chain_letters.tolist()) & chain_tokens
+    for tok in chain_tokens - found_tokens:
+        print(f"Warning: conditional group chain {tok!r} not found among protein chains, skipping")
+
+    group_mask = np.isin(chain_letters, list(chain_tokens))
+    return torch.tensor(group_mask, dtype=torch.bool, device=device)
+
+
 def featurize(
     input_dict,
     cutoff_for_score=8.0,

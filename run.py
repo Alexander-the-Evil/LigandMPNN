@@ -10,6 +10,7 @@ import torch
 from data_utils import (
     alphabet,
     atom_order,
+    build_chain_group_mask,
     build_ligand_group_mask,
     element_dict_rev,
     featurize,
@@ -221,10 +222,6 @@ def main(args) -> None:
         fixed_residues = fixed_residues_multi[pdb]
         redesigned_residues = redesigned_residues_multi[pdb]
         conditional_group_tokens = conditional_group_multi[pdb]
-        if conditional_group_tokens and args.model_type != "ligand_mpnn":
-            raise ValueError(
-                "--conditional_group is only supported with --model_type ligand_mpnn"
-            )
         if conditional_group_tokens and (
             args.symmetry_residues or args.symmetry_weights
         ):
@@ -262,6 +259,24 @@ def main(args) -> None:
         encoded_residue_dict_rev = dict(
             zip(list(range(len(encoded_residues))), encoded_residues)
         )
+
+        # A bare chain letter (e.g. "B", no trailing resnum) names a whole protein
+        # chain to exclude from the structural graph (any model_type -- backbone
+        # frames only, see build_chain_group_mask). Anything else is a ligand
+        # "<chain><resnum>" token (existing behavior, ligand_mpnn only).
+        known_chains = set(protein_dict["chain_list"])
+        conditional_group_chain_tokens = [
+            tok for tok in conditional_group_tokens if tok in known_chains
+        ]
+        conditional_group_ligand_tokens = [
+            tok for tok in conditional_group_tokens if tok not in known_chains
+        ]
+        if conditional_group_ligand_tokens and args.model_type != "ligand_mpnn":
+            raise ValueError(
+                "--conditional_group ligand-residue tokens "
+                f"{conditional_group_ligand_tokens} are only supported with "
+                "--model_type ligand_mpnn; whole-chain tokens (e.g. 'B') work with any model_type"
+            )
 
         bias_AA_per_residue = torch.zeros(
             [len(encoded_residues), 21], device=device, dtype=torch.float32
@@ -449,8 +464,10 @@ def main(args) -> None:
             feature_dict["batch_size"] = args.batch_size
             B, L, _, _ = feature_dict["X"].shape  # batch size should be 1 for now.
             if conditional_group_tokens:
+                feature_dict["conditional_group_scale"] = args.conditional_group_scale
+            if conditional_group_ligand_tokens:
                 group_mask = build_ligand_group_mask(
-                    other_atoms, protein_dict["Y_t"], conditional_group_tokens
+                    other_atoms, protein_dict["Y_t"], conditional_group_ligand_tokens
                 )
                 alt_protein_dict = dict(protein_dict)
                 alt_protein_dict["Y_m"] = protein_dict["Y_m"] * (
@@ -466,7 +483,14 @@ def main(args) -> None:
                 feature_dict["Y_no_group"] = alt_feature_dict["Y"]
                 feature_dict["Y_t_no_group"] = alt_feature_dict["Y_t"]
                 feature_dict["Y_m_no_group"] = alt_feature_dict["Y_m"]
-                feature_dict["conditional_group_scale"] = args.conditional_group_scale
+            if conditional_group_chain_tokens:
+                chain_excl_mask = build_chain_group_mask(
+                    protein_dict["chain_letters"], conditional_group_chain_tokens,
+                    device=feature_dict["mask"].device,
+                )
+                feature_dict["mask_no_group"] = feature_dict["mask"] * (
+                    ~chain_excl_mask
+                ).to(feature_dict["mask"].dtype)[None,]
             # add additional keys to the feature dictionary
             feature_dict["temperature"] = args.temperature
             feature_dict["max_mutations"] = args.max_mutations
@@ -482,15 +506,22 @@ def main(args) -> None:
             feature_dict["symmetry_residues"] = remapped_symmetry_residues
             feature_dict["symmetry_weights"] = symmetry_weights
 
-            if sum([bool(args.decoding_order), bool(args.decoding_order_from_distances), bool(args.decoding_order_from_entropy)]) > 1:
+            if sum([
+                bool(args.decoding_order),
+                bool(args.decoding_order_from_distances),
+                bool(args.decoding_order_from_entropy),
+                bool(args.decoding_order_interface),
+            ]) > 1:
                 raise ValueError(
-                    "--decoding_order, --decoding_order_from_distances, and --decoding_order_from_entropy are mutually exclusive"
+                    "--decoding_order, --decoding_order_from_distances, --decoding_order_from_entropy, "
+                    "and --decoding_order_interface are mutually exclusive"
                 )
 
             # Precompute ordering inputs (once per PDB, before batch loop)
-            base_decoding_scores = None  # used by explicit list mode
-            ca_coords = None             # used by distance mode
-            anchor_coords = None         # used by distance mode
+            base_decoding_scores = None    # used by explicit list mode
+            ca_coords = None               # used by distance mode and interface mode
+            anchor_coords = None           # used by distance mode (one global anchor set)
+            interface_chain_groups = None  # used by interface mode (one anchor set per chain)
 
             if args.decoding_order:
                 chain_mask_1d = feature_dict["chain_mask"][0]  # [L]
@@ -547,6 +578,41 @@ def main(args) -> None:
                         )
                     anchor_coords = torch.stack(anchor_coords_list)  # [A, 3]
 
+            elif args.decoding_order_interface:
+                interface_spec = _load_str_or_file(args.decoding_order_interface)
+                spec_chains = interface_spec.split(":")
+                if len(spec_chains) < 2:
+                    raise ValueError(
+                        "--decoding_order_interface needs at least 2 colon-separated "
+                        f"chains (e.g. 'A:B'), got {interface_spec!r}"
+                    )
+                unknown_chains = set(spec_chains) - set(protein_dict["chain_list"])
+                if unknown_chains:
+                    raise ValueError(
+                        f"--decoding_order_interface chain(s) not found in structure: {sorted(unknown_chains)}"
+                    )
+                chain_letters_arr = np.array(chain_letters_list)
+                chain_mask_1d = feature_dict["chain_mask"][0]  # [L]
+                designable_chains = set(chain_letters_arr[chain_mask_1d.cpu().numpy() > 0].tolist())
+                missing_chains = designable_chains - set(spec_chains)
+                if missing_chains:
+                    raise ValueError(
+                        "--decoding_order_interface must list every chain that has a "
+                        f"designable residue; missing {sorted(missing_chains)}"
+                    )
+                ca_coords = protein_dict["X"][:, 1, :]  # [L, 3]
+                backbone_coords = protein_dict["X"].reshape(-1, 3)  # [L*4, 3] -- N,CA,C,O per residue
+                interface_chain_groups = []
+                for c in spec_chains:
+                    own_mask = torch.tensor(chain_letters_arr == c, device=device)
+                    other_chain_mask = np.isin(chain_letters_arr, [x for x in spec_chains if x != c])
+                    other_mask_expanded = torch.tensor(
+                        np.repeat(other_chain_mask, 4), device=device
+                    )  # [L*4] -- repeat each residue's flag across its 4 backbone atoms
+                    other_coords = backbone_coords[other_mask_expanded]  # [n_other*4, 3]
+                    if own_mask.any() and len(other_coords) > 0:
+                        interface_chain_groups.append((own_mask, other_coords))
+
             sampling_probs_list = []
             log_probs_list = []
             decoding_order_list = []
@@ -566,9 +632,20 @@ def main(args) -> None:
                         noisy_ca = ca_coords.unsqueeze(0) + noise  # [B, L, 3]
                     else:
                         noisy_ca = ca_coords.unsqueeze(0).expand(B_curr, -1, -1)
-                    diffs = noisy_ca.unsqueeze(2) - anchor_coords.unsqueeze(0).unsqueeze(0)  # [B, L, A, 3]
-                    dists = torch.norm(diffs, dim=-1)   # [B, L, A]
-                    dists_min = dists.min(dim=-1).values  # [B, L]
+                    if interface_chain_groups is not None:
+                        # Per-residue anchor set depends on which listed chain the
+                        # residue is on (every OTHER listed chain's backbone atoms) --
+                        # not one global anchor set, so each chain's group is handled
+                        # separately and scattered into the same [B, L] tensor.
+                        dists_min = torch.zeros(B_curr, L, device=device)
+                        for own_mask, other_coords in interface_chain_groups:
+                            own_ca = noisy_ca[:, own_mask, :]  # [B, n_own, 3]
+                            diffs = own_ca.unsqueeze(2) - other_coords[None, None, :, :]  # [B, n_own, A_c, 3]
+                            dists_min[:, own_mask] = torch.norm(diffs, dim=-1).min(dim=-1).values
+                    else:
+                        diffs = noisy_ca.unsqueeze(2) - anchor_coords.unsqueeze(0).unsqueeze(0)  # [B, L, A, 3]
+                        dists = torch.norm(diffs, dim=-1)   # [B, L, A]
+                        dists_min = dists.min(dim=-1).values  # [B, L]
                     if args.decoding_order_reverse:
                         # farthest-first: remap to (per-sample max - dist), still >= 0 so the
                         # model's downstream abs() is a no-op, and ascending-argsort on this
@@ -1022,19 +1099,25 @@ if __name__ == "__main__":
         "--decoding_order",
         type=str,
         default="",
-        help="Ordered space-separated residue IDs (e.g. 'A15 A16 B42') or path to a text file with the same format. Listed residues are decoded in that order before any unlisted designable residues. Mutually exclusive with --decoding_order_from_distances.",
+        help="Ordered space-separated residue IDs (e.g. 'A15 A16 B42') or path to a text file with the same format. Listed residues are decoded in that order before any unlisted designable residues. Mutually exclusive with --decoding_order_from_distances and --decoding_order_interface.",
     )
     argparser.add_argument(
         "--decoding_order_from_distances",
         type=str,
         default="",
-        help="Anchor atom specification for distance-based decoding order. Use 'ligand' to anchor on all ligand atoms, or provide space-separated '{chain}{resnum}_{atom_name}' tokens (e.g. 'A15_CA B101_C1') for protein or ligand atoms. A file path containing either format is also accepted. Residues with smaller min-distance to anchors are decoded first. Mutually exclusive with --decoding_order.",
+        help="Anchor atom specification for distance-based decoding order. Use 'ligand' to anchor on all ligand atoms, or provide space-separated '{chain}{resnum}_{atom_name}' tokens (e.g. 'A15_CA B101_C1') for protein or ligand atoms. A file path containing either format is also accepted. Residues with smaller min-distance to anchors are decoded first. Mutually exclusive with --decoding_order and --decoding_order_interface.",
+    )
+    argparser.add_argument(
+        "--decoding_order_interface",
+        type=str,
+        default="",
+        help="Colon-separated chain letters (e.g. 'A:B', or 'A:B:C' for 3+), or a path to a file with the same format. Generalizes --decoding_order_from_distances per-residue: for a residue on one of the listed chains, the anchor set is the backbone atoms (N,CA,C,O) of every OTHER listed chain combined (e.g. for 'A:B:C', chain A's residues anchor on B+C's backbone atoms, chain B's on A+C's, etc.) -- i.e. each listed chain treats every other listed chain as if it were the ligand in --decoding_order_from_distances. Every chain in the structure with at least one designable residue must be listed. Residues with smaller min-distance to their own anchor set are decoded first. Mutually exclusive with --decoding_order, --decoding_order_from_distances, and --decoding_order_from_entropy.",
     )
     argparser.add_argument(
         "--decoding_order_from_entropy",
         type=int,
         default=0,
-        help="1 - sort designable residues by Shannon entropy of the backbone-conditioned amino acid distribution (encoder output, no sequence context), lowest entropy first. Mutually exclusive with --decoding_order and --decoding_order_from_distances.",
+        help="1 - sort designable residues by Shannon entropy of the backbone-conditioned amino acid distribution (encoder output, no sequence context), lowest entropy first. Mutually exclusive with --decoding_order, --decoding_order_from_distances, and --decoding_order_interface.",
     )
     argparser.add_argument(
         "--full_sequence_context",
@@ -1046,7 +1129,7 @@ if __name__ == "__main__":
         "--conditional_group",
         type=str,
         default="",
-        help="Space-separated ligand residue IDs (e.g. 'B401 B402') naming a ligand group, or path to a text file with the same format. At each decoding step probabilities are computed with and without this group's ligand context; the without-group run is treated as a prior and the with-group run reweights it via classifier-free guidance (see --conditional_group_scale). Only supported for --model_type ligand_mpnn. Mutually exclusive with --symmetry_residues.",
+        help="Space-separated tokens naming a conditioning group, or path to a text file with the same format. Two kinds, freely mixable in the same list: (1) ligand residue IDs (e.g. 'B401 B402') -- toggles that ligand context in the Y/Y_t/Y_m channel, only supported for --model_type ligand_mpnn; (2) a bare chain letter (e.g. 'B', no trailing resnum) -- excludes that whole protein chain from the backbone-frame structural graph (X/mask/E_idx) for the without-group pass, supported for ANY --model_type, never exposes sidechain coordinates or sequence identity (same backbone-only representation as a normal protein_mpnn run). Either way: at each decoding step probabilities are computed with and without the group's context; the without-group run is treated as a prior and the with-group run reweights it via classifier-free guidance (see --conditional_group_scale). Mutually exclusive with --symmetry_residues.",
     )
     argparser.add_argument(
         "--conditional_group_multi",
@@ -1070,7 +1153,7 @@ if __name__ == "__main__":
         "--decoding_order_reverse",
         type=int,
         default=0,
-        help="1 - reverse the priority order for --decoding_order_from_distances only (farthest-from-anchor decoded first instead of nearest-first). Test/ablation flag. No effect on --decoding_order_from_entropy or --decoding_order (explicit list). Implemented by remapping each sample's per-position distances to (per-sample max distance - distance) before the model's own argsort(abs(randn)) step -- still non-negative, so the abs() is a no-op, and ascending-sort on the remapped value is descending-sort on the original distance.",
+        help="1 - reverse the priority order for --decoding_order_from_distances or --decoding_order_interface only (farthest-from-anchor decoded first instead of nearest-first). Test/ablation flag. No effect on --decoding_order_from_entropy or --decoding_order (explicit list). Implemented by remapping each sample's per-position distances to (per-sample max distance - distance) before the model's own argsort(abs(randn)) step -- still non-negative, so the abs() is a no-op, and ascending-sort on the remapped value is descending-sort on the original distance.",
     )
     argparser.add_argument(
         "--temperature",
